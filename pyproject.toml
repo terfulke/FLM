@@ -1,0 +1,22 @@
+[project]
+name = "flm"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Lakshmi Narayanan S",email = "lnarayanan47@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10, <4.0.0"
+dependencies = [
+    "flwr[simulation] (>=1.19.0,<2.0.0)",
+    "scikit-learn (>=1.7.0,<2.0.0)",
+    "torch (==2.2.2)",
+    "numpy (<2.0.0)"
+]
+
+[tool.poetry]
+package-mode = false 
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
