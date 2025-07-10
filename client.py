@@ -3,36 +3,45 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from model import Net
 from dataProcessing import make_client_splits, load_and_preprocess
-import random
+from flwr.common import Context
 import time
+import random
+
 
 class FLClient(fl.client.NumPyClient):
-    def __init__(self, model, train_ds, val_ds, local_epochs=1, is_async=False):
+    def __init__(self, model, train_ds, val_ds, local_epochs: int = 1):
         self.model = model
         self.train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
         self.val_loader = DataLoader(val_ds, batch_size=32)
         self.criterion = torch.nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)  # default lr
         self.epochs = local_epochs
-        self.is_async = is_async
 
     def get_parameters(self, config=None):
+        # Return model parameters as a list of NumPy arrays
         return [val.cpu().numpy() for val in self.model.state_dict().values()]
 
     def set_parameters(self, parameters):
+        # Set model parameters from a list of NumPy arrays
         params_dict = zip(self.model.state_dict().keys(), [torch.tensor(p) for p in parameters])
         state_dict = {k: v for k, v in params_dict}
         self.model.load_state_dict(state_dict, strict=True)
-
+        
     def fit(self, parameters, config):
+        # Simulate random delay to mimic asynchronous arrival
+        if random.random() < 0.3:
+            print("[Client] Simulating dropout: returning empty parameters")
+            return [], 0, {}
+
+        # Set model parameters
         self.set_parameters(parameters)
 
-        # Simulate async client taking random time before training
-        if self.is_async:
-            delay = random.uniform(2, 5)  # Async clients take 2-5 seconds delay
-            print(f"Async client delaying for {delay:.2f} seconds")
-            time.sleep(delay)
+        # Set adaptive learning rate if provided
+        if "lr" in config:
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = config["lr"]
 
+        # Train model
         self.model.train()
         for _ in range(self.epochs):
             for X, y in self.train_loader:
@@ -45,6 +54,7 @@ class FLClient(fl.client.NumPyClient):
         return self.get_parameters(), len(self.train_loader.dataset), {}
 
     def evaluate(self, parameters, config):
+        # Evaluate model on validation data
         self.set_parameters(parameters)
         self.model.eval()
         loss, correct, total = 0.0, 0, 0
@@ -56,29 +66,36 @@ class FLClient(fl.client.NumPyClient):
                 total += len(y)
         return loss / total, total, {"accuracy": correct / total}
 
-from flwr.common import Context
 
-def get_client_fn(splits, local_epochs=1, async_client_ids=None):
-    async_client_ids = set(async_client_ids or [])
+def get_client_fn(splits, local_epochs: int = 1):
+    """
+    Factory to create a client_fn for Flower simulation.
 
-    def client_fn(context: Context):
-        cid = context.run_id
+    Args:
+        splits: List of DataFrames, one per client.
+        local_epochs: Number of epochs for each client to train.
+
+    Returns:
+        A function that takes a client ID (str) and returns an FLClient.
+    """
+    def client_fn(cid: Context):
         cid_int = int(cid)
         df_client = splits[cid_int]
 
+        # Prepare tensors
         X = torch.tensor(df_client.drop('target', axis=1).values, dtype=torch.float32)
         y = torch.tensor(df_client['target'].values, dtype=torch.long)
 
+        # Train/val split
         train_size = int(0.8 * len(df_client))
         val_size = len(df_client) - train_size
         train_ds, val_ds = random_split(TensorDataset(X, y), [train_size, val_size])
 
+        # Build model
         num_features = X.shape[1]
         num_classes = len(df_client['target'].unique())
         model = Net(num_features=num_features, num_classes=num_classes)
 
-        is_async = cid in async_client_ids
-
-        return FLClient(model, train_ds, val_ds, local_epochs, is_async=is_async).to_client()
+        return FLClient(model, train_ds, val_ds, local_epochs).to_client()
 
     return client_fn

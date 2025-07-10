@@ -1,94 +1,78 @@
 from flwr.server.strategy import FedAvg
-from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
+import flwr as fl
+from flwr.common import parameters_to_ndarrays, ndarrays_to_parameters
+from collections import defaultdict
 
-class HybridSyncAsyncStrategy(FedAvg):
-    def __init__(self, async_client_ids=None, async_weight=0.5, *args, **kwargs):
+
+class FedSAStrategy(FedAvg):
+    def __init__(self, M=3, tau_0=3, base_lr=1.0, num_total_clients=10, evaluate_metrics_aggregation_fn=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.async_client_ids = set(async_client_ids or [])
-        self.async_updates = []
-        self.async_weight = async_weight
+        self.M = M
+        self.tau_0 = tau_0
+        self.round = 0
+        self.base_lr = base_lr
+        self.num_total_clients = num_total_clients
         self.latest_weights = None
+        self.client_staleness = defaultdict(lambda: 0)
+        self.participation_count = defaultdict(lambda: 0)
+        self.evaluate_metrics_aggregation_fn = evaluate_metrics_aggregation_fn
+        self.last_configured_cids = []  # To track who got selected
 
     def aggregate_fit(self, rnd, results, failures):
-        # Separate sync and async client results
-        sync_results = []
-        new_async_updates = []
+        results = [r for r in results if r[1].num_examples > 0]
+        self.round = rnd
 
-        for client, fit_res in results:
-            if client.cid in self.async_client_ids:
-                # Collect async updates
-                new_async_updates.append((client.cid, fit_res.parameters, fit_res.num_examples))
+        if len(results) < self.M:
+            print(f"[FedSA] Round {rnd}: Only {len(results)} updates received, waiting for {self.M}")
+            return ndarrays_to_parameters(self.latest_weights) if self.latest_weights else None, {}
+
+        selected = results[:self.M]
+        self.last_configured_cids = [client.cid for client, _ in selected]
+
+        total_examples = sum(fit_res.num_examples for _, fit_res in selected)
+        weighted_sum = None
+
+        for client, fit_res in selected:
+            cid = client.cid
+            self.participation_count[cid] += 1
+            self.client_staleness[cid] = 0  # Reset staleness
+
+            weights = parameters_to_ndarrays(fit_res.parameters)
+            weighted = [layer * fit_res.num_examples for layer in weights]
+
+            if weighted_sum is None:
+                weighted_sum = weighted
             else:
-                # Sync updates
-                sync_results.append((client, fit_res))
+                weighted_sum = [a + b for a, b in zip(weighted_sum, weighted)]
 
-        # Aggregate synchronous results using FedAvg
-        agg_sync = super().aggregate_fit(rnd, sync_results, failures)
+        for client, _ in results[self.M:]:
+            self.client_staleness[client.cid] += 1
 
-        # If no sync results, return None (no aggregation possible)
-        if agg_sync is None:
-            return None
+        agg_weights = [layer / total_examples for layer in weighted_sum]
+        self.latest_weights = agg_weights
+        agg_parameters = ndarrays_to_parameters(agg_weights)
 
-        # Unpack parameters and metrics returned by FedAvg
-        agg_sync_parameters, agg_sync_metrics = agg_sync
+        metrics_list = [(fit_res.num_examples, fit_res.metrics or {}) for _, fit_res in selected]
+        aggregated_metrics = self.evaluate_metrics_aggregation_fn(metrics_list) if self.evaluate_metrics_aggregation_fn else {}
 
-        # Convert aggregated parameters to ndarrays
-        agg_sync_weights = parameters_to_ndarrays(agg_sync_parameters)
+        return agg_parameters, aggregated_metrics
 
-        # Initialize latest weights if not set
-        if self.latest_weights is None:
-            self.latest_weights = agg_sync_weights
+    def configure_fit(self, server_round, parameters, client_manager):
+        # Override to inject adaptive learning rates
+        selected_clients = list(client_manager.sample(num_clients=self.M, min_num_clients=self.M))
+        self.last_configured_cids = [client.cid for client in selected_clients]
 
-        # Add new async updates to existing async updates list
-        self.async_updates.extend(new_async_updates)
+        instructions = []
 
-        # Aggregate async updates if any
-        if self.async_updates:
-            total_async_examples = sum(num_ex for _, _, num_ex in self.async_updates)
-            async_weights_sum = None
-            for _, params, num_examples in self.async_updates:
-                w = parameters_to_ndarrays(params)
-                weighted_w = [layer * num_examples for layer in w]
-                if async_weights_sum is None:
-                    async_weights_sum = weighted_w
-                else:
-                    async_weights_sum = [a + b for a, b in zip(async_weights_sum, weighted_w)]
-            async_avg = [layer / total_async_examples for layer in async_weights_sum]
-        else:
-            async_avg = None
+        for client in selected_clients:
+            cid = client.cid
+            f_i = max(1, self.participation_count[cid])
+            eta_i = self.base_lr / (self.num_total_clients * f_i)
 
-        # Combine sync and async weights according to async_weight
-        if async_avg is not None:
-            combined_weights = [
-                (1 - self.async_weight) * s + self.async_weight * a
-                for s, a in zip(agg_sync_weights, async_avg)
-            ]
-        else:
-            combined_weights = agg_sync_weights
+            config = {
+                "lr": eta_i
+            }
 
-        # Clear async updates after aggregation
-        self.async_updates = []
+            instructions.append((client, fl.server.client_proxy.FitIns(parameters, config)))
 
-        self.latest_weights = combined_weights
-
-        combined_parameters = ndarrays_to_parameters(combined_weights)
-
-        # Aggregate metrics from synchronous clients only (example: accuracy)
-        metrics_aggregated = {}
-        if sync_results:
-            total_examples = sum(fit_res.num_examples for _, fit_res in sync_results)
-            accuracy_sum = 0.0
-            count = 0
-            for _, fit_res in sync_results:
-                metrics = fit_res.metrics or {}
-                if "accuracy" in metrics:
-                    accuracy_sum += metrics["accuracy"] * fit_res.num_examples
-                    count += fit_res.num_examples
-            if count > 0:
-                metrics_aggregated["accuracy"] = accuracy_sum / count
-
-        # Merge metrics from FedAvg (agg_sync_metrics) if needed
-        # Example: metrics_aggregated.update(agg_sync_metrics)
-
-        # Return parameters and metrics tuple
-        return combined_parameters, metrics_aggregated
+        return instructions
