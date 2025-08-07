@@ -15,10 +15,10 @@ def aggregate_accuracy(metrics):
 
 # Define experiment configurations
 tests = [
-    {"name": "5_clients_iid_E1_async",   "num_clients": 5,  "split": "iid",    "local_epochs": 1, "async_weight": 0.3},
-    {"name": "10_clients_iid_E1_async",  "num_clients": 10, "split": "iid",    "local_epochs": 1, "async_weight": 0.3},
-    {"name": "5_clients_noniid_E1_async","num_clients": 5,  "split": "noniid", "local_epochs": 1, "async_weight": 0.3},
-    {"name": "5_clients_iid_E5_async",   "num_clients": 5,  "split": "iid",    "local_epochs": 5, "async_weight": 0.3},
+    {"name": "5_clients_iid_E1_hybrid",   "num_clients": 5,  "split": "iid",    "local_epochs": 1, "async_weight": 0.3},
+    {"name": "10_clients_iid_E1_hybrid",  "num_clients": 10, "split": "iid",    "local_epochs": 1, "async_weight": 0.3},
+    {"name": "5_clients_noniid_E1_hybrid","num_clients": 5,  "split": "noniid", "local_epochs": 1, "async_weight": 0.3},
+    {"name": "5_clients_iid_E5_hybrid",   "num_clients": 5,  "split": "iid",    "local_epochs": 5, "async_weight": 0.3},
 ]
 
 # Load data once
@@ -34,9 +34,9 @@ for cfg in tests:
     client_fn = get_client_fn(splits, local_epochs=cfg["local_epochs"])
 
     strategy = FedSAStrategy(
-        M=3,
-        tau_0=2,
-        base_lr=1.0,
+        M=num_clients-num_clients//3,
+        tau_0=1,
+        base_lr=0.1,
         num_total_clients=num_clients,
         evaluate_metrics_aggregation_fn=aggregate_accuracy,
         fraction_fit=0.3,

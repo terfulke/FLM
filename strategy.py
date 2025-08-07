@@ -16,26 +16,43 @@ class FedSAStrategy(FedAvg):
         self.client_staleness = defaultdict(lambda: 0)
         self.participation_count = defaultdict(lambda: 0)
         self.evaluate_metrics_aggregation_fn = evaluate_metrics_aggregation_fn
-        self.last_configured_cids = []  # To track who got selected
+        self.last_configured_cids = []
 
     def aggregate_fit(self, rnd, results, failures):
         results = [r for r in results if r[1].num_examples > 0]
         self.round = rnd
 
-        if len(results) < self.M:
-            print(f"[FedSA] Round {rnd}: Only {len(results)} updates received, waiting for {self.M}")
+        # Initialize staleness for any new clients
+        for client, _ in results:
+            cid = client.cid
+            if cid not in self.client_staleness:
+                self.client_staleness[cid] = 0
+
+        # Filter out clients whose staleness exceeds tau_0
+        filtered_results = []
+        for client, fit_res in results:
+            cid = client.cid
+            if self.client_staleness[cid] <= self.tau_0:
+                filtered_results.append((client, fit_res))
+            else:
+                print(f"[FedSA] Skipping stale client {cid} with staleness {self.client_staleness[cid]}")
+
+        if len(filtered_results) < self.M:
+            print(f"[FedSA] Round {rnd}: Only {len(filtered_results)} usable updates received, waiting for at least {self.M}")
             return ndarrays_to_parameters(self.latest_weights) if self.latest_weights else None, {}
 
-        selected = results[:self.M]
+        # Select first M non-stale clients
+        selected = filtered_results[:self.M]
         self.last_configured_cids = [client.cid for client, _ in selected]
 
         total_examples = sum(fit_res.num_examples for _, fit_res in selected)
         weighted_sum = None
 
+        # Aggregate weights
         for client, fit_res in selected:
             cid = client.cid
             self.participation_count[cid] += 1
-            self.client_staleness[cid] = 0  # Reset staleness
+            self.client_staleness[cid] = 0  # Reset staleness for used client
 
             weights = parameters_to_ndarrays(fit_res.parameters)
             weighted = [layer * fit_res.num_examples for layer in weights]
@@ -45,15 +62,27 @@ class FedSAStrategy(FedAvg):
             else:
                 weighted_sum = [a + b for a, b in zip(weighted_sum, weighted)]
 
-        for client, _ in results[self.M:]:
-            self.client_staleness[client.cid] += 1
+        # Update staleness for all known clients that were NOT selected
+        used_cids = set(self.last_configured_cids)
+        for cid in self.client_staleness:
+            if cid not in used_cids:
+                self.client_staleness[cid] += 1
 
+        # Log staleness info
+        print(f"[FedSA] Client staleness map: {dict(self.client_staleness)}")
+
+        # Final aggregation
         agg_weights = [layer / total_examples for layer in weighted_sum]
         self.latest_weights = agg_weights
         agg_parameters = ndarrays_to_parameters(agg_weights)
 
+        # Aggregate metrics if function provided
         metrics_list = [(fit_res.num_examples, fit_res.metrics or {}) for _, fit_res in selected]
-        aggregated_metrics = self.evaluate_metrics_aggregation_fn(metrics_list) if self.evaluate_metrics_aggregation_fn else {}
+        aggregated_metrics = (
+            self.evaluate_metrics_aggregation_fn(metrics_list)
+            if self.evaluate_metrics_aggregation_fn
+            else {}
+        )
 
         return agg_parameters, aggregated_metrics
 

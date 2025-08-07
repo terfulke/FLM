@@ -2,10 +2,9 @@ import flwr as fl
 import torch
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from model import Net
-from dataProcessing import make_client_splits, load_and_preprocess
 from flwr.common import Context
-import time
 import random
+import time
 
 
 class FLClient(fl.client.NumPyClient):
@@ -28,10 +27,15 @@ class FLClient(fl.client.NumPyClient):
         self.model.load_state_dict(state_dict, strict=True)
         
     def fit(self, parameters, config):
-        # Simulate random delay to mimic asynchronous arrival
-        if random.random() < 0.3:
-            print("[Client] Simulating dropout: returning empty parameters")
-            return [], 0, {}
+        # Simulating clients delays
+        if random.random() < 0.25:
+            delay = random.uniform(5, 8)  
+            print(f"[Client] Simulating delay of {delay:.2f} seconds")
+            time.sleep(delay)
+        else:
+            delay = random.uniform(0, 3)  
+            print(f"[Client] Simulating delay of {delay:.2f} seconds")
+            time.sleep(delay)
 
         # Set model parameters
         self.set_parameters(parameters)
@@ -96,6 +100,6 @@ def get_client_fn(splits, local_epochs: int = 1):
         num_classes = len(df_client['target'].unique())
         model = Net(num_features=num_features, num_classes=num_classes)
 
-        return FLClient(model, train_ds, val_ds, local_epochs).to_client()
+        return FLClient(model, train_ds, val_ds, local_epochs)
 
     return client_fn
